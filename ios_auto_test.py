@@ -727,6 +727,23 @@ def _launch_via_lldb(bundle_id: str, udid: str, launch_timeout: int,
     elapsed_ms = int((time.time() - launch_start) * 1000)
     result["launch_duration_ms"] = elapsed_ms
 
+    lldb_connect_failed = (
+        not crash_info["crash_detected"]
+        and ("no such process" in lldb_text
+             or "attach failed" in lldb_text
+             or "Could not start" in lldb_text
+             or len(lldb_text.strip()) < 200)
+    )
+
+    if lldb_connect_failed:
+        result["launch_successful"] = False
+        result["debugger_error"] = (
+            "lldb requires debugserver which is unavailable on this device. "
+            "Developer Disk Image may be incompatible with this iOS version. "
+            "Crash analysis will use syslog + crash reports instead.")
+        result["details"].append(result["debugger_error"])
+        return result
+
     if crash_info["crash_detected"]:
         result["launch_successful"] = False
         result["crash_detected"] = True
@@ -748,7 +765,6 @@ def _launch_via_lldb(bundle_id: str, udid: str, launch_timeout: int,
         result["launch_successful"] = False
         result["details"].append(
             f"lldb session ended without clear crash signal")
-
     else:
         result["launch_successful"] = False
         result["debugger_error"] = (
@@ -1261,6 +1277,12 @@ def launch_and_monitor(bundle_id: str, udid: str, launch_timeout: int,
             bundle_id, udid, launch_timeout, monitor_time,
             capturer, launch_start, lldb_script_path,
         )
+        if launch_result.get("debugger_error") and not launch_result.get("process_started"):
+            print(f"[WARN] lldb unavailable, falling back to devicectl...")
+            launch_result = _launch_via_devicectl(
+                bundle_id, udid, launch_timeout, monitor_time,
+                capturer, launch_start,
+            )
     else:
         launch_result = _launch_via_devicectl(
             bundle_id, udid, launch_timeout, monitor_time, capturer, launch_start,
