@@ -611,6 +611,50 @@ def _parse_lldb_crash(lldb_output: str) -> dict:
     return info
 
 
+def _try_devicectl_console(bundle_id: str, udid: str, launch_start: float,
+                            capturer: "SyslogCapturer") -> dict:
+    """Try devicectl --console as a lightweight crash signal detector.
+
+    Returns result dict with process_started + crash_signal if successful.
+    """
+    result: dict = {
+        "launch_successful": False,
+        "process_started": False,
+        "crash_detected": False,
+        "crash_signal": "",
+        "debugger_output": "",
+        "details": [],
+        "launch_duration_ms": 0,
+    }
+    try:
+        r = subprocess.run(
+            ["xcrun", "devicectl", "device", "process", "launch",
+             "--device", udid, "--console", "--timeout", "15", bundle_id],
+            capture_output=True, text=True, timeout=20,
+        )
+        output = r.stdout + r.stderr
+        result["debugger_output"] = output
+        result["launch_duration_ms"] = int((time.time() - launch_start) * 1000)
+
+        signal_match = re.search(r"terminated due to signal (\d+)", output)
+        launch_match = re.search(r"Launched application", output)
+
+        if launch_match:
+            result["process_started"] = True
+        if signal_match:
+            result["crash_detected"] = True
+            result["crash_signal"] = signal_match.group(1)
+            result["details"].append(
+                f"[CONSOLE] App terminated due to signal {signal_match.group(1)}")
+    except subprocess.TimeoutExpired:
+        result["details"].append("devicectl --console timed out")
+        result["launch_duration_ms"] = int((time.time() - launch_start) * 1000)
+    except Exception as e:
+        result["details"].append(f"devicectl --console error: {e}")
+
+    return result
+
+
 def _launch_via_lldb(bundle_id: str, udid: str, launch_timeout: int,
                      monitor_time: int, capturer: "SyslogCapturer",
                      launch_start: float,
@@ -739,9 +783,17 @@ def _launch_via_lldb(bundle_id: str, udid: str, launch_timeout: int,
         result["launch_successful"] = False
         result["debugger_error"] = (
             "lldb requires debugserver which is unavailable on this device. "
-            "Developer Disk Image may be incompatible with this iOS version. "
-            "Crash analysis will use syslog + crash reports instead.")
+            "Developer Disk Image may be incompatible with this iOS version.")
         result["details"].append(result["debugger_error"])
+
+        print("[INFO] lldb unavailable, trying devicectl --console...")
+        console_result = _try_devicectl_console(
+            bundle_id, udid, launch_start, capturer,
+        )
+        if console_result.get("process_started"):
+            result.update(console_result)
+            return result
+
         return result
 
     if crash_info["crash_detected"]:
