@@ -60,6 +60,7 @@ IOS_DEPLOY = shutil.which("ios-deploy") or "ios-deploy"
 IDEVICEIMAGEMOUNTER = shutil.which("ideviceimagemounter") or "ideviceimagemounter"
 IDEVICEINFO = shutil.which("ideviceinfo") or "ideviceinfo"
 DEVICECTL = shutil.which("xcrun") or "xcrun"
+LLDB = shutil.which("xcrun") and "xcrun lldb" or "lldb"
 
 DEBUGSERVER_FAIL_PATTERNS = [
     (re.compile(r"Could not start com\.apple\.debugserver"), "debugserver_not_started"),
@@ -555,6 +556,332 @@ def classify_from_syslog(syslog_text: str, details: list[str]) -> dict:
 # App launch + monitoring
 # ---------------------------------------------------------------------------
 
+LLDB_CRASH_PATTERNS = [
+    (re.compile(r"Process (\d+) stopped"), "process_stopped"),
+    (re.compile(r"Process (\d+) exited with status"), "process_exited"),
+    (re.compile(r"signal\s+(SIG\w+)", re.IGNORECASE), "lldb_signal"),
+    (re.compile(r"stop reason\s*=\s*(.+)", re.IGNORECASE), "stop_reason"),
+    (re.compile(r"thread #\d+.*\b(EXC_BAD_ACCESS|EXC_BREAKPOINT|EXC_CRASH|"
+                r"EXC_RESOURCE|EXC_GUARD|SIGABRT|SIGSEGV|SIGBUS|SIGILL|"
+                r"SIGTRAP|SIGKILL)\b", re.IGNORECASE), "exception_type"),
+    (re.compile(r"fault address:\s*(0x[0-9a-f]+)", re.IGNORECASE), "fault_address"),
+    (re.compile(r"error:\s*(.+)", re.IGNORECASE), "lldb_error"),
+]
+
+
+def _parse_lldb_crash(lldb_output: str) -> dict:
+    """Parse lldb output to extract crash information."""
+    info: dict = {
+        "crash_detected": False,
+        "signal_name": "",
+        "stop_reason": "",
+        "fault_address": "",
+        "exception_type": "",
+        "backtrace": "",
+        "pid": "",
+    }
+
+    for pattern, key in LLDB_CRASH_PATTERNS:
+        matches = list(pattern.finditer(lldb_output))
+        if matches:
+            m = matches[-1]
+            if key == "process_stopped":
+                info["pid"] = m.group(1)
+            elif key == "lldb_signal":
+                info["signal_name"] = m.group(1)
+                info["crash_detected"] = True
+            elif key == "stop_reason":
+                info["stop_reason"] = m.group(1).strip()
+            elif key == "fault_address":
+                info["fault_address"] = m.group(1)
+            elif key == "exception_type":
+                info["exception_type"] = m.group(0).strip()
+                info["crash_detected"] = True
+            elif key == "lldb_error":
+                info["stop_reason"] = m.group(1).strip()
+
+    # Backtrace section: from first "* thread #" to "quit" or EOF
+    bt_matches = list(re.finditer(r"\* thread #(\d+).*", lldb_output))
+    if bt_matches:
+        bt_start = bt_matches[0].start()
+        quit_pos = lldb_output.find("\nquit", bt_start)
+        bt_end = quit_pos if quit_pos > 0 else len(lldb_output)
+        info["backtrace"] = lldb_output[bt_start:bt_end].strip()
+
+    return info
+
+
+def _launch_via_lldb(bundle_id: str, udid: str, launch_timeout: int,
+                     monitor_time: int, capturer: "SyslogCapturer",
+                     launch_start: float,
+                     lldb_script_path: Optional[str] = None,
+                     ipa_path: str = "",
+                     output_dir: str = "") -> dict:
+    """Launch app with lldb attached to capture crash backtrace in real time.
+
+    Two-phase approach (--start-stopped unreliable on some apps):
+      1. Start lldb with `device process attach -n MobileBank --waitfor`
+      2. Launch the app normally via devicectl
+      3. lldb catches the process immediately → continue → crash/exit
+      4. Parse lldb output for crash info
+
+    Returns result_data dict.
+    """
+    result: dict = {
+        "launch_successful": False,
+        "process_started": False,
+        "process_ended_cleanly": False,
+        "crash_detected": False,
+        "watchdog_detected": False,
+        "exit_code": 0,
+        "crash_signal": "",
+        "launch_duration_ms": 0,
+        "runtime_before_crash_ms": 0,
+        "debugger_output": "",
+        "debugger_error": "",
+        "fallback_used": False,
+        "details": [],
+    }
+
+    print(f"[INFO] Launching with lldb debugger attached...")
+
+    lldb_commands = [
+        f"device select {udid}",
+    ]
+    if lldb_script_path and os.path.exists(lldb_script_path):
+        lldb_commands.append(f"command source {lldb_script_path}")
+    lldb_commands += [
+        "device process attach -n MobileBank --waitfor",
+        "bt all",
+        "process continue",
+        "bt all",
+        "thread info",
+        "register read",
+        "frame variable",
+        "quit",
+    ]
+
+    lldb_script = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".lldb", delete=False, prefix="lldb_auto_",
+    )
+    for cmd in lldb_commands:
+        lldb_script.write(cmd + "\n")
+    lldb_script.close()
+    script_path = lldb_script.name
+
+    lldb_output_lines: list[str] = []
+    lldb_proc = subprocess.Popen(
+        ["xcrun", "lldb", "-b", "-s", script_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+
+    time.sleep(2)
+
+    dc_cmd = [
+        "xcrun", "devicectl", "device", "process", "launch",
+        "--device", udid, "--timeout", "15", bundle_id,
+    ]
+    dc_proc = subprocess.Popen(
+        dc_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        dc_output, _ = dc_proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        dc_proc.kill()
+        dc_output, _ = dc_proc.communicate()
+        result["details"].append("devicectl launch timed out")
+
+    if "Launched" in (dc_output or ""):
+        result["process_started"] = True
+        result["details"].append("App launched, waiting for lldb crash capture...")
+
+    deadline = time.time() + launch_timeout + monitor_time + 60
+    import select
+    while lldb_proc.poll() is None and time.time() < deadline:
+        try:
+            readable, _, _ = select.select([lldb_proc.stdout], [], [], 1.0)
+            if readable:
+                line = lldb_proc.stdout.readline()
+                if line:
+                    lldb_output_lines.append(line)
+        except Exception:
+            pass
+
+    if lldb_proc.poll() is None:
+        lldb_proc.terminate()
+        try:
+            lldb_proc.wait(timeout=3)
+        except Exception:
+            lldb_proc.kill()
+
+    lldb_text = "".join(lldb_output_lines)
+    result["debugger_output"] = lldb_text
+
+    try:
+        os.unlink(script_path)
+    except Exception:
+        pass
+
+    crash_info = _parse_lldb_crash(lldb_text)
+
+    elapsed_ms = int((time.time() - launch_start) * 1000)
+    result["launch_duration_ms"] = elapsed_ms
+
+    if crash_info["crash_detected"]:
+        result["launch_successful"] = False
+        result["crash_detected"] = True
+        result["crash_signal"] = crash_info["signal_name"]
+        result["details"].append(
+            f"[LLDB] Signal: {crash_info['signal_name']}, "
+            f"Stop: {crash_info['stop_reason']}, "
+            f"Fault: {crash_info['fault_address']}, "
+            f"Exception: {crash_info['exception_type']}")
+        if crash_info["backtrace"]:
+            result["details"].append(
+                f"[BACKTRACE]\n{crash_info['backtrace'][:2000]}")
+        result["runtime_before_crash_ms"] = elapsed_ms
+    elif result["process_started"] and crash_info.get("pid"):
+        result["launch_successful"] = True
+        result["process_ended_cleanly"] = True
+        result["runtime_before_crash_ms"] = elapsed_ms
+    elif result["process_started"]:
+        result["launch_successful"] = False
+        result["details"].append(
+            f"lldb session ended without clear crash signal")
+
+    else:
+        result["launch_successful"] = False
+        result["debugger_error"] = (
+            f"devicectl failed: {(dc_output or '')[-300:]}, "
+            f"lldb output: {lldb_text[-200:] if lldb_text else '(empty)'}")
+        result["details"].append(result["debugger_error"])
+
+    syslog_text = capturer.get_text()
+    for pattern, name in CRASH_PATTERNS + CODESIGNING_KILL_PATTERNS:
+        if pattern.search(syslog_text):
+            if not result["crash_detected"]:
+                result["crash_detected"] = True
+            result["details"].append(f"[SYSLOG:{name}] detected")
+
+    return result
+    result["details"].append(f"devicectl: {dc_output.strip()[-200:]}")
+
+    if "Launched" not in dc_output:
+        result["debugger_error"] = dc_output.strip()
+        result["details"].append("devicectl failed to launch app in stopped state")
+        result["launch_duration_ms"] = int((time.time() - launch_start) * 1000)
+        return result
+
+    process_detected = wait_for_app_start(bundle_id, udid, timeout=10)
+    if not process_detected:
+        result["debugger_error"] = "App process did not appear after --start-stopped launch"
+        result["launch_duration_ms"] = int((time.time() - launch_start) * 1000)
+        return result
+
+    pid = get_app_pid(bundle_id, udid)
+    result["process_started"] = True
+    result["details"].append(f"Process detected: PID={pid}")
+
+    lldb_commands = [
+        f"device select {udid}",
+    ]
+    if lldb_script_path and os.path.exists(lldb_script_path):
+        lldb_commands.append(f"command source {lldb_script_path}")
+    lldb_commands += [
+        f"device process attach -p {pid}",
+        "bt all",
+        "process continue",
+        "bt all",
+        "thread info",
+        "register read",
+        "frame variable",
+        "quit",
+    ]
+
+    lldb_script = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".lldb", delete=False, prefix="lldb_auto_",
+    )
+    for cmd in lldb_commands:
+        lldb_script.write(cmd + "\n")
+    lldb_script.close()
+    script_path = lldb_script.name
+
+    print(f"[INFO] Running lldb (may take up to {launch_timeout + monitor_time + 30}s)...")
+    lldb_output_lines: list[str] = []
+    try:
+        lldb_proc = subprocess.Popen(
+            ["xcrun", "lldb", "-b", "-s", script_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+        deadline = time.time() + launch_timeout + monitor_time + 60
+        import select
+        while lldb_proc.poll() is None and time.time() < deadline:
+            try:
+                readable, _, _ = select.select([lldb_proc.stdout], [], [], 1.0)
+                if readable:
+                    line = lldb_proc.stdout.readline()
+                    if line:
+                        lldb_output_lines.append(line)
+            except Exception:
+                pass
+
+        if lldb_proc.poll() is None:
+            lldb_proc.terminate()
+            try:
+                lldb_proc.wait(timeout=3)
+            except Exception:
+                lldb_proc.kill()
+    except Exception as e:
+        result["details"].append(f"lldb error: {e}")
+    finally:
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
+
+    lldb_text = "".join(lldb_output_lines)
+    result["debugger_output"] = lldb_text
+
+    crash_info = _parse_lldb_crash(lldb_text)
+
+    elapsed_ms = int((time.time() - launch_start) * 1000)
+    result["launch_duration_ms"] = elapsed_ms
+
+    if crash_info["crash_detected"]:
+        result["launch_successful"] = False
+        result["crash_detected"] = True
+        result["crash_signal"] = crash_info["signal_name"]
+        result["details"].append(
+            f"[LLDB] Signal: {crash_info['signal_name']}, "
+            f"Stop: {crash_info['stop_reason']}, "
+            f"Fault: {crash_info['fault_address']}, "
+            f"Exception: {crash_info['exception_type']}")
+        if crash_info["backtrace"]:
+            # Store backtrace in details (first 2000 chars)
+            result["details"].append(
+                f"[BACKTRACE]\n{crash_info['backtrace'][:2000]}")
+        result["runtime_before_crash_ms"] = elapsed_ms
+    elif crash_info.get("pid") and not crash_info["crash_detected"]:
+        result["launch_successful"] = True
+        result["process_ended_cleanly"] = True
+        result["runtime_before_crash_ms"] = elapsed_ms
+    else:
+        result["launch_successful"] = False
+        result["details"].append(
+            f"lldb session ended without clear crash signal. "
+            f"Last output: {lldb_text[-300:] if lldb_text else '(empty)'}")
+
+    # Also check syslog for crash evidence
+    syslog_text = capturer.get_text()
+    for pattern, name in CRASH_PATTERNS + CODESIGNING_KILL_PATTERNS:
+        if pattern.search(syslog_text):
+            if not result["crash_detected"]:
+                result["crash_detected"] = True
+            result["details"].append(f"[SYSLOG:{name}] detected")
+
+    return result
+
 def _launch_via_devicectl(bundle_id: str, udid: str, launch_timeout: int,
                          monitor_time: int, capturer: "SyslogCapturer",
                          launch_start: float) -> dict:
@@ -896,13 +1223,15 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def launch_and_monitor(bundle_id: str, udid: str, launch_timeout: int,
-                       monitor_time: int) -> dict:
+                       monitor_time: int, lldb_debug: bool = False,
+                       lldb_script_path: Optional[str] = None) -> dict:
     """Launch the app and monitor its state.
 
     Strategy (priority order):
-      1. devicectl (Xcode 16+ CoreDevice) - no debugserver needed
-      2. idevicedebug (debugger attached, crash signal detection)
-      3. ios-deploy (last resort fallback)
+      1. lldb debug (if --lldb-debug): attach lldb, capture crash backtrace
+      2. devicectl (Xcode 16+ CoreDevice) - no debugserver needed
+      3. idevicedebug (debugger attached, crash signal detection)
+      4. ios-deploy (last resort fallback)
       After launch, monitor process state via pidlist and syslog.
     """
     launch_start = time.time()
@@ -927,9 +1256,15 @@ def launch_and_monitor(bundle_id: str, udid: str, launch_timeout: int,
     capturer.start()
     time.sleep(1)
 
-    launch_result = _launch_via_devicectl(
-        bundle_id, udid, launch_timeout, monitor_time, capturer, launch_start,
-    )
+    if lldb_debug:
+        launch_result = _launch_via_lldb(
+            bundle_id, udid, launch_timeout, monitor_time,
+            capturer, launch_start, lldb_script_path,
+        )
+    else:
+        launch_result = _launch_via_devicectl(
+            bundle_id, udid, launch_timeout, monitor_time, capturer, launch_start,
+        )
 
     for key in ("launch_successful", "process_started", "process_ended_cleanly",
                 "crash_detected", "watchdog_detected", "exit_code",
@@ -1205,7 +1540,8 @@ def run_auto_test(ipa_path: Optional[str] = None,
                    sign_entitlements: Optional[list[str]] = None,
                    restore_symbols: bool = False,
                    provision_profile: Optional[str] = None,
-                   restore_stripped: bool = False) -> TestResult:
+                   restore_stripped: bool = False,
+                   lldb_debug: bool = False) -> TestResult:
     """
     Run the complete automated test flow.
 
@@ -1378,8 +1714,20 @@ def run_auto_test(ipa_path: Optional[str] = None,
         run_cmd([IDEVICEDEBUG, "-u", device_udid, "kill", bundle_id], timeout=5)
         time.sleep(1)
 
+    lldb_script = os.path.join(output_dir, "lldb_load_symbols.txt")
+    lldb_script_path_arg = None
+    if lldb_debug:
+        if not os.path.exists(lldb_script) and ipa_path:
+            extract_dir = os.path.join(output_dir, "ipa_binaries")
+            generate_lldb_symbol_script(ipa_path, lldb_script,
+                                        extract_dir=extract_dir)
+        if os.path.exists(lldb_script):
+            lldb_script_path_arg = lldb_script
+
     monitor_data = launch_and_monitor(
-        bundle_id, device_udid, launch_timeout, monitor_time
+        bundle_id, device_udid, launch_timeout, monitor_time,
+        lldb_debug=lldb_debug,
+        lldb_script_path=lldb_script_path_arg,
     )
 
     # -----------------------------------------------------------------------
@@ -1414,10 +1762,10 @@ def run_auto_test(ipa_path: Optional[str] = None,
     result.runtime_duration_ms = monitor_data.get("runtime_before_crash_ms", 0)
     result.exit_code = monitor_data.get("exit_code", 0)
 
-    # Save debugger output
     debugger_output = monitor_data.get("debugger_output", "")
     if debugger_output:
-        debug_path = os.path.join(output_dir, "debugger_output.log")
+        suffix = "_lldb.log" if lldb_debug else ".log"
+        debug_path = os.path.join(output_dir, f"debugger_output{suffix}")
         with open(debug_path, "w") as f:
             f.write(debugger_output)
         result.log_files["debugger_output"] = debug_path
@@ -1597,6 +1945,11 @@ Status Classifications:
         "--provision-profile", type=str, default=None,
         help="Path to .mobileprovision file for signing (e.g. wildcard profile)",
     )
+    parser.add_argument(
+        "--lldb-debug", action="store_true",
+        help="Launch app with lldb attached to capture real-time crash "
+             "backtrace, registers, and local variables",
+    )
 
     args = parser.parse_args()
 
@@ -1618,6 +1971,7 @@ Status Classifications:
         restore_symbols=args.restore_symbols,
         provision_profile=args.provision_profile,
         restore_stripped=args.restore_stripped_symbols,
+        lldb_debug=args.lldb_debug,
     )
 
     # Exit with appropriate code
