@@ -1,0 +1,8 @@
+crash_reports/
+ios_test_output/
+new_crash/
+symbolicated/
+lldb_symbols.txt
+__pycache__/
+*.pyc
+.DS_Store
