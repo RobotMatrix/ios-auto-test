@@ -168,6 +168,7 @@ SIGNING_PATTERNS = [
     (re.compile(r"could not be verified", re.IGNORECASE), "not_verified"),
     (re.compile(r"Failed to verify code signature", re.IGNORECASE), "verify_failed"),
     (re.compile(r"application is missing", re.IGNORECASE), "app_missing"),
+    (re.compile(r"MismatchedApplicationIdentifierEntitlement", re.IGNORECASE), "mismatched_identifier"),
 ]
 
 JETSAM_PATTERNS = [
@@ -182,6 +183,17 @@ FREEZE_HANG_PATTERNS = [
     (re.compile(r"unresponsive", re.IGNORECASE), "unresponsive"),
     (re.compile(r"took too long", re.IGNORECASE), "took_too_long"),
     (re.compile(r"0xdead10cc"), "deadlock"),
+]
+
+# Errors logged by runningboardd/launchd when the kernel rejects the spawn
+# itself (before a pid exists — no crash report is generated for these).
+SPAWN_ERROR_PATTERNS = [
+    (re.compile(r"NSPOSIXErrorDomain Code=88|error 88 \(0x58\)|EBADMACHO", re.IGNORECASE),
+     "spawn_EBADMACHO_88"),
+    (re.compile(r"NSPOSIXErrorDomain Code=22|error 22 \(0x16\)|EINVAL", re.IGNORECASE),
+     "spawn_EINVAL_22"),
+    (re.compile(r"Launchd job spawn failed", re.IGNORECASE), "launchd_spawn_failed"),
+    (re.compile(r"Malformed Mach-o file", re.IGNORECASE), "malformed_macho"),
 ]
 
 
@@ -337,26 +349,48 @@ def install_app(ipa_path: str, udid: str, reinstall: bool = False) -> tuple[bool
         else:
             return True, f"App {bundle_id} already installed, skipping installation"
 
-    # Install
+    result, output = _install_ipa_once(udid, ipa_path)
+
+    # Retry: stale install record with mismatched entitlements is invisible
+    # to `list --user` but blocks upgrade. Uninstall and retry once.
+    if not result and "mismatched_identifier" in output:
+        print(f"[INFO] MismatchedApplicationIdentifierEntitlement detected, "
+              f"uninstalling stale record for {bundle_id} and retrying...")
+        uninstall_result = run_cmd(
+            [IDEVICEINSTALLER, "-u", udid, "uninstall", bundle_id],
+            timeout=60,
+        )
+        if uninstall_result.returncode != 0:
+            print(f"[WARN] Failed to uninstall stale record: "
+                  f"{uninstall_result.stderr.strip()}")
+        result, output = _install_ipa_once(udid, ipa_path)
+
+    output_lower = output.lower()
+
+    if result and "complete" in output_lower:
+        return True, f"Installation successful: {bundle_id}"
+    elif not result:
+        # Classify failure type
+        for pattern, fail_type in SIGNING_PATTERNS:
+            if pattern.search(output):
+                return False, f"Signing/entitlement error ({fail_type}): {output[:500]}"
+        return False, f"Installation failed (exit=1): {output[:500]}"
+    else:
+        return True, f"Installation completed: {output[:300]}"
+
+
+def _install_ipa_once(udid: str, ipa_path: str) -> tuple[bool, str]:
+    """Run a single ideviceinstaller install attempt.
+
+    Returns (success, stripped_output).
+    """
     print(f"[INFO] Installing {ipa_path} -> {udid} ...")
     result = run_cmd(
         [IDEVICEINSTALLER, "-u", udid, "install", ipa_path],
         timeout=120,
     )
-
     output = strip_color_codes(result.stdout + result.stderr)
-    output_lower = output.lower()
-
-    if result.returncode == 0 and "complete" in output_lower:
-        return True, f"Installation successful: {bundle_id}"
-    elif result.returncode != 0:
-        # Classify failure type
-        for pattern, fail_type in SIGNING_PATTERNS:
-            if pattern.search(output):
-                return False, f"Signing/entitlement error ({fail_type}): {output[:500]}"
-        return False, f"Installation failed (exit={result.returncode}): {output[:500]}"
-    else:
-        return True, f"Installation completed: {output[:300]}"
+    return result.returncode == 0, output
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +548,7 @@ def classify_from_syslog(syslog_text: str, details: list[str]) -> dict:
         "signing_errors": [],
         "jetsam_events": [],
         "freeze_hang_events": [],
+        "spawn_errors": [],
         "exception_codes": [],
         "exception_types": [],
         "termination_reasons": [],
@@ -540,6 +575,11 @@ def classify_from_syslog(syslog_text: str, details: list[str]) -> dict:
     for pattern, name in FREEZE_HANG_PATTERNS:
         if pattern.search(syslog_text):
             result["freeze_hang_events"].append(name)
+
+    for pattern, name in SPAWN_ERROR_PATTERNS:
+        if pattern.search(syslog_text):
+            if name not in result["spawn_errors"]:
+                result["spawn_errors"].append(name)
 
     # Extract exception codes
     for code_pattern in [WATCHDOG_CODE, USER_FORCE_QUIT, THERMAL, VOIP_RESTART,
@@ -1440,10 +1480,26 @@ def classify_status(monitor_data: dict, launch_timeout: int,
 
     # 2. Launch Failure - app never started
     if not monitor_data.get("process_started"):
-        # Check debugger error FIRST (more specific/reliable than syslog keyword matching)
         debugger_error = monitor_data.get("debugger_error", "")
+        is_debugserver_issue = "debugserver" in debugger_error.lower()
+
+        # Spawn-stage rejections first: the debugger surface only shows the
+        # generic devicectl chain (FBSOpenApplicationErrorDomain → ... →
+        # error 88), so the specific kernel/launchd reason from syslog is the
+        # actionable part and must win over the generic debugger message.
+        # (Exception: debugserver-not-mounted is a tooling failure, keep it.)
+        spawn_errors = syslog_analysis.get("spawn_errors", [])
+        if spawn_errors and not is_debugserver_issue:
+            msg = (f"Launch failed at spawn stage (no crash report is generated "
+                   f"for this class of error). Kernel/launchd rejected the "
+                   f"process: {', '.join(spawn_errors)}. Likely causes: "
+                   f"entitlements rejected at spawn (hardened-process keys, "
+                   f"platform-restrictions), or stale CodeResources after "
+                   f"re-signing. Check debugger_output.log for the full error chain.")
+            return AppStatus.LAUNCH_FAILURE, msg, details
+
         if debugger_error:
-            if "debugserver" in debugger_error.lower():
+            if is_debugserver_issue:
                 if monitor_data.get("fallback_used"):
                     msg = (f"Launch failed: debugserver unavailable and ios-deploy "
                            f"fallback also failed. Check: (1) Developer Mode enabled "
@@ -1453,13 +1509,9 @@ def classify_status(monitor_data: dict, launch_timeout: int,
                     msg = (f"Launch failed: debugserver unavailable. "
                            f"Developer disk image may not be mounted, or Developer "
                            f"Mode not enabled on device. Error: {debugger_error[:150]}")
-            else:
-                msg = (f"Launch failed: debugger error (exit="
-                       f"{monitor_data.get('exit_code', '?')}). "
-                       f"{debugger_error[:200]}")
-            return AppStatus.LAUNCH_FAILURE, msg, details
+                return AppStatus.LAUNCH_FAILURE, msg, details
 
-        # Check signing errors from syslog (only if NO debugger error)
+        # Check signing errors from syslog
         signing_errors = syslog_analysis.get("signing_errors", [])
         if signing_errors:
             msg = f"Launch failed: possible signing/entitlement issues: {', '.join(signing_errors)}"
@@ -1539,14 +1591,20 @@ def classify_status(monitor_data: dict, launch_timeout: int,
 # ---------------------------------------------------------------------------
 
 def collect_crash_reports(udid: str, output_dir: str, bundle_id: Optional[str] = None,
-                          app_name: Optional[str] = None) -> list[str]:
+                          app_name: Optional[str] = None,
+                          test_start_epoch: Optional[float] = None) -> list[str]:
     """Collect crash reports from device. Returns list of report file paths.
 
-    If app_name is provided, filters by the app's process name (e.g., 'SecureUtilityPlusDemo').
-    If bundle_id is provided, it's used as a secondary filter.
+    Only reports generated at/after test_start_epoch count as new. The device
+    accumulates unrelated historical reports, so stale ones are moved aside
+    into crash_reports/Retired/ instead of being classified as this run's
+    findings (a past run misattributed 2025 SecureUtilityPlusDemo reports to
+    the app under test).
     """
     crash_dir = os.path.join(output_dir, "crash_reports")
     os.makedirs(crash_dir, exist_ok=True)
+    retired_dir = os.path.join(crash_dir, "Retired")
+    os.makedirs(retired_dir, exist_ok=True)
 
     cmd = [IDEVICECRASHREPORT, "-u", udid, "-e", "-k", crash_dir]
     if app_name:
@@ -1569,6 +1627,37 @@ def collect_crash_reports(udid: str, output_dir: str, bundle_id: Optional[str] =
                 if f.endswith(".ips"):
                     reports.append(os.path.join(root, f))
     return reports
+
+
+def separate_crash_reports(reports: list[str], crash_dir: str,
+                           test_start_epoch: Optional[float]) -> tuple[list[str], list[str]]:
+    """Split pulled .ips files into new (this run) vs stale (pre-existing).
+
+    Stale reports are moved to crash_reports/Retired/. Returns
+    (new_reports, stale_reports).
+    """
+    crash_dir = os.path.abspath(crash_dir)
+    retired_dir = os.path.join(crash_dir, "Retired")
+    os.makedirs(retired_dir, exist_ok=True)
+
+    new_reports: list[str] = []
+    stale_reports: list[str] = []
+    for path in reports:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if test_start_epoch and mtime >= test_start_epoch:
+            new_reports.append(path)
+        else:
+            dest = os.path.join(retired_dir, os.path.basename(path))
+            if os.path.abspath(path) != os.path.abspath(dest):
+                try:
+                    shutil.move(path, dest)
+                except OSError:
+                    pass
+            stale_reports.append(dest if os.path.exists(dest) else path)
+    return new_reports, stale_reports
 
 
 def collect_logarchive(udid: str, output_dir: str, name: str = "logarchive") -> Optional[str]:
@@ -1752,6 +1841,7 @@ def run_auto_test(ipa_path: Optional[str] = None,
     print(f"{'='*60}")
 
     syslog_path = os.path.join(output_dir, f"syslog_{bundle_id.replace('.', '_')}.log")
+    test_start_epoch = time.time()
     syslog_capturer = SyslogCapturer(device_udid, output_path=syslog_path)
     syslog_capturer.start()
     time.sleep(2)  # Let syslog connection stabilize
@@ -1845,18 +1935,24 @@ def run_auto_test(ipa_path: Optional[str] = None,
         result.log_files["debugger_output"] = debug_path
 
     # Collect crash reports if there was a crash
+    new_crash_reports: list[str] = []
     if status in {AppStatus.LAUNCH_CRASH, AppStatus.RUNTIME_CRASH,
                   AppStatus.LAUNCH_TIMEOUT, AppStatus.LAUNCH_FAILURE}:
         print("[INFO] Collecting crash reports...")
         app_name = bundle_id.split(".")[-1] if bundle_id else None
-        crash_reports = collect_crash_reports(device_udid, output_dir,
-                                              bundle_id=bundle_id,
-                                              app_name=app_name)
-        result.crash_reports = crash_reports
-        if crash_reports:
-            print(f"[OK] Found {len(crash_reports)} crash report(s)")
+        all_reports = collect_crash_reports(device_udid, output_dir,
+                                            bundle_id=bundle_id,
+                                            app_name=app_name)
+        new_crash_reports, stale_reports = separate_crash_reports(
+            all_reports, os.path.join(output_dir, "crash_reports"), test_start_epoch)
+        result.crash_reports = new_crash_reports
+        if stale_reports:
+            print(f"[INFO] Retired {len(stale_reports)} stale (pre-test) report(s) "
+                  f"-> crash_reports/Retired/")
+        if new_crash_reports:
+            print(f"[OK] {len(new_crash_reports)} new crash report(s) from this run")
             if status == AppStatus.LAUNCH_FAILURE:
-                for report_path in crash_reports:
+                for report_path in new_crash_reports:
                     try:
                         with open(report_path, "r", errors="ignore") as f:
                             content = f.read()
@@ -1875,7 +1971,49 @@ def run_auto_test(ipa_path: Optional[str] = None,
                     except Exception:
                         pass
         else:
-            print("[INFO] No crash reports found on device")
+            print("[INFO] No new crash reports from this run "
+                  "(spawn-stage failures never generate them)")
+
+    # SUCCESS is provisional until a short settling window confirms the
+    # process did not die right after launch (e.g. CODESIGNING Invalid Page
+    # fires ~100ms post-launch and would otherwise be reported as success).
+    if status == AppStatus.SUCCESS:
+        print("[INFO] Settling window: re-checking for post-launch crash reports (8s)...")
+        time.sleep(8)
+        app_name = bundle_id.split(".")[-1] if bundle_id else None
+        all_reports = collect_crash_reports(device_udid, output_dir,
+                                            bundle_id=bundle_id,
+                                            app_name=app_name)
+        new_crash_reports, stale_reports = separate_crash_reports(
+            all_reports, os.path.join(output_dir, "crash_reports"), test_start_epoch)
+        if stale_reports:
+            print(f"[INFO] Retired {len(stale_reports)} stale (pre-test) report(s) "
+                  f"-> crash_reports/Retired/")
+        if new_crash_reports:
+            for report_path in new_crash_reports:
+                try:
+                    with open(report_path, "r", errors="ignore") as f:
+                        content = f.read()
+                    term = ""
+                    for m in re.finditer(r'"indicator"\s*:\s*"([^"]+)"|"namespace"\s*:\s*"([^"]+)"', content):
+                        seg = m.group(1) or m.group(2)
+                        if seg and seg not in term:
+                            term = f"{term} {seg}".strip()
+                    result.status = AppStatus.LAUNCH_CRASH.value
+                    result.summary = (
+                        f"Downgraded from SUCCESS: process died shortly after launch "
+                        f"(runtime {result.runtime_duration_ms}ms). Crash report: "
+                        f"{os.path.basename(report_path)}. Termination: {term or 'see report'}")
+                    result.details.append(
+                        f"Post-launch crash detected in: {os.path.basename(report_path)}")
+                    print(f"[WARN] Post-launch crash detected -> status downgraded to "
+                          f"LAUNCH_CRASH ({os.path.basename(report_path)})")
+                    break
+                except Exception:
+                    pass
+            result.crash_reports = new_crash_reports
+        else:
+            print("[OK] No post-launch crash reports — SUCCESS confirmed")
 
     # Always collect logarchive for full diagnostics (OSLog, hang logs, etc.)
     print("[INFO] Collecting logarchive (OSLog, hang/freeze data)...")

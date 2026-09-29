@@ -479,9 +479,7 @@ def restore_stripped_symbols_in_app(app_path: str) -> int:
 def sign_binary(binary_path: str, identity: str, entitlements_path: str,
                 force: bool = True) -> bool:
     """Sign a binary with the given identity and entitlements."""
-    cmd = ["codesign", "-s", identity, "--entitlements", entitlements_path]
-    if force:
-        cmd.append("-f")
+    cmd = ["codesign", "-f", "-s", identity, "--entitlements", entitlements_path]
     cmd.append(binary_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -564,14 +562,35 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
             print(f"[INFO] {count} binaries processed")
 
         # Step 2: Get/modify entitlements
-        print("[INFO] Fetching entitlements...")
+        #
+        # Use a MINIMAL entitlement set instead of copying everything from the
+        # provisioning profile. Verified by ~20 on-device A/B tests
+        # (iPhone13 iOS 26.5.2 / iPhone15 iOS 26.5): profile-bundled
+        # com.apple.security.hardened-process.* keys — notably
+        # platform-restrictions-string ("*") — trigger kernel-level spawn
+        # rejection (EBADMACHO/EINVAL, posix error 88/22) that presents as
+        # "Launchd job spawn failed: Malformed Mach-o file". The failure is
+        # non-monotonic in the key set (some single keys pass, combinations
+        # fail), so filtering specific keys is not reliable; keep the set
+        # minimal and only carry what the extra_entitlements request needs.
+        BASE_KEYS = {
+            "application-identifier",
+            "com.apple.developer.default-data-protection",
+            "com.apple.developer.team-identifier",
+            "get-task-allow",
+            "keychain-access-groups",
+        }
 
         entitlements: dict = {}
         if provision_profile and os.path.isfile(provision_profile):
             print(f"[INFO] Using provision profile: {os.path.basename(provision_profile)}")
             shutil.copy2(provision_profile, os.path.join(app_path, "embedded.mobileprovision"))
             prov_ent = get_entitlements_from_profile(provision_profile) or {}
-            entitlements = dict(prov_ent)
+            entitlements = {k: v for k, v in prov_ent.items() if k in BASE_KEYS}
+            skipped = sorted(set(prov_ent) - set(entitlements))
+            if skipped:
+                print(f"[INFO] Skipped {len(skipped)} non-essential profile "
+                      f"entitlements (kernel-validated at spawn)")
             for ent in extra_entitlements:
                 if ent not in entitlements:
                     print(f"[WARN] Entitlement '{ent}' not in profile, skipping")
@@ -583,17 +602,17 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
                 for k, v in prov_ent.items():
                     if k not in existing_ent:
                         existing_ent[k] = v
-            entitlements = dict(existing_ent)
+            entitlements = {k: v for k, v in existing_ent.items() if k in BASE_KEYS}
             for ent in extra_entitlements:
                 if ent not in entitlements:
                     entitlements[ent] = True
+                    print(f"[INFO] Added entitlement: {ent}")
 
-        # Write entitlements plist
         ent_path = os.path.join(tmpdir, "entitlements.plist")
         with open(ent_path, "wb") as f:
             plistlib.dump(entitlements, f)
 
-        # Step 3: Re-sign all binaries (main + frameworks + appex)
+        # Step 3: Re-sign all binaries
         print("[INFO] Signing binaries...")
         binaries_to_sign = [main_binary]
 
@@ -602,9 +621,7 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
             for fw in os.listdir(frameworks_dir):
                 fw_path = os.path.join(frameworks_dir, fw)
                 if fw.endswith(".framework"):
-                    fw_bin = os.path.join(fw_path, fw.replace(".framework", ""))
-                    if os.path.isfile(fw_bin):
-                        binaries_to_sign.append(fw_bin)
+                    binaries_to_sign.append(fw_path)
                 elif fw.endswith(".dylib"):
                     binaries_to_sign.append(fw_path)
 
@@ -613,16 +630,8 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
             for plug in os.listdir(plugins_dir):
                 plug_path = os.path.join(plugins_dir, plug)
                 if plug.endswith(".appex"):
-                    plug_info = os.path.join(plug_path, "Info.plist")
-                    if os.path.exists(plug_info):
-                        with open(plug_info, "rb") as f:
-                            pinfo = plistlib.load(f)
-                        plug_bin = pinfo.get("CFBundleExecutable", "")
-                        plug_bin_path = os.path.join(plug_path, plug_bin)
-                        if os.path.isfile(plug_bin_path):
-                            binaries_to_sign.append(plug_bin_path)
+                    binaries_to_sign.append(plug_path)
 
-        # Sign frameworks/appex first, then main binary
         framework_bins = [b for b in binaries_to_sign if b != main_binary]
         all_ok = True
         for bin_path in framework_bins:
@@ -630,6 +639,21 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
                 all_ok = False
         if not sign_binary(main_binary, identity, ent_path):
             all_ok = False
+
+        # Re-sign the .app bundle itself so _CodeSignature/CodeResources is
+        # regenerated to match the new binary hashes. Skipping this leaves a
+        # stale CodeResources from the original IPA; the app installs but the
+        # kernel rejects the spawn with EBADMACHO (error 88, "Malformed
+        # Mach-o file") because the sealed framework hashes no longer match.
+        r = subprocess.run(
+            ["codesign", "-f", "-s", identity, "--entitlements", ent_path, app_path],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"[FAIL] codesign app bundle: {r.stderr.strip()[:200]}")
+            all_ok = False
+        else:
+            print("  [OK] Signed: app bundle (CodeResources regenerated)")
 
         if not all_ok:
             print("[WARN] Some binaries failed to sign")
@@ -646,7 +670,8 @@ def auto_sign_ipa(ipa_path: str, output_path: Optional[str] = None,
 
         # Verify
         result = subprocess.run(
-            ["codesign", "-v", main_binary], capture_output=True, text=True,
+            ["codesign", "-v", "--deep", "--strict", app_path],
+            capture_output=True, text=True,
         )
         if result.returncode == 0:
             print("[OK] Verification passed")
