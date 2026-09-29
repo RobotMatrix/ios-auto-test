@@ -6,3 +6,4 @@ lldb_symbols.txt
 __pycache__/
 *.pyc
 .DS_Store
+vendor_wildcard.mobileprovision
