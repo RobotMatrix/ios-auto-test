@@ -212,7 +212,55 @@ ios_test_output/
 ```
 ios_auto_test.py   # 主流程：设备检测/安装/启动/监控/状态分类/输出
 ios_utils.py       # 工具库：restore-symbol 集成、auto_sign_ipa 重签、崩溃符号化
-vendor_wildcard.mobileprovision  # 通配符描述文件（需替换为自己的）
+vendor_wildcard.mobileprovision  # 通配符描述文件（需替换为自己的，不入库）
+```
+
+## 开发环境多 Git 服务器身份配置
+
+一台 Mac 同时使用 GitHub（个人）+ 公司 GitLab 时的推荐配置，可直接复用：
+
+### SSH 分流（~/.ssh/config）
+
+```ssh-config
+# Git 服务器的 SSH 登录用户固定是 git, 账号身份由密钥决定
+Host github
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/ed25519_github
+    IdentitiesOnly yes
+
+Host BangcleGitLab
+    HostName gitlab.bangcle.com
+    User git
+    IdentityFile ~/.ssh/ed25519_bangcle_gitlab
+    IdentitiesOnly yes
+```
+
+克隆时用别名：`git clone git@github.com:xxx/repo.git` / `git clone git@BangcleGitLab:group/repo.git`
+
+### 身份按 remote URL 自动切换（~/.gitconfig）
+
+```ini
+# hasconfig 按 remote URL 匹配, clone 下来身份自动正确, 仓库放哪都行 (git >= 2.36)
+[includeIf "hasconfig:remote.*.url:git@github.com:*/**"]
+	path = ~/.gitconfig-personal
+[includeIf "hasconfig:remote.*.url:git@BangcleGitLab:*/**"]
+	path = ~/.gitconfig-work
+
+# 目录规则作辅助兜底
+[includeIf "gitdir:~/projects/personal/"]
+	path = ~/.gitconfig-personal
+[includeIf "gitdir:~/projects/work/"]
+	path = ~/.gitconfig-work
+```
+
+`~/.gitconfig-personal` / `~/.gitconfig-work` 各自只含一个 `[user]` 段。noreply
+邮箱格式：`{账号ID}+{登录名}@users.noreply.github.com`（ID 可通过 `gh api user --jq .id` 查）。
+
+优先级：仓库级配置 > hasconfig > gitdir > 全局兜底。验证方法：
+
+```bash
+cd 任意仓库 && git config user.email   # 看命中了哪套身份
 ```
 
 ## 已知限制

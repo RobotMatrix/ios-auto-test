@@ -174,3 +174,13 @@ runningboardd: Launch failed with Error Domain=NSPOSIXErrorDomain Code=88
     ├─ 是 → spawn 阶段拒绝（entitlements/CodeResources 问题），看 debugger_output.log 错误链
     └─ 否 → 看 crash_reports/ 本次新增的 .ips（运行期崩溃），symbolicated/ 已符号化
 ```
+
+## [2026-09-30] 文档补充：多 Git 服务器身份配置
+
+README 新增「开发环境多 Git 服务器身份配置」章节：
+
+- SSH 别名分流（github / BangcleGitLab），强调 SSH `User` 字段必须为 `git`
+  （Git 服务器固定用 git 用户登录，账号身份由密钥决定——写账号用户名会被拒绝）
+- `includeIf hasconfig:remote.*.url` 按 remote URL 自动切换 commit 身份
+  （git >= 2.36），配合 gitdir 目录规则双兜底
+- GitHub noreply 邮箱正确格式说明
